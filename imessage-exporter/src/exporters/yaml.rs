@@ -15,6 +15,7 @@ use crate::{
 
 use imessage_database::{
     error::table::TableError,
+    message_types::text_effects::TextEffect,
     message_types::variants::{CustomBalloon, Tapback, TapbackAction, Variant},
     tables::{
         attachment::Attachment,
@@ -23,7 +24,7 @@ use imessage_database::{
             Message,
             models::{AttachmentMeta, BubbleComponent, TextAttributes},
         },
-        table::{ME, ORPHANED, Table},
+        table::{ORPHANED, Table},
     },
     util::dates::format,
 };
@@ -252,8 +253,6 @@ impl YAML<'_> {
         )?;
 
         // Message text + translation
-        write_kv_literal_opt_str(&mut out, 4, "text", message.text.as_deref())?;
-
         if self.config.translated_messages.contains(&message.guid)
             && let Ok(Some(translation)) = message.get_translation(self.config.data_source.db())
         {
@@ -293,19 +292,6 @@ impl YAML<'_> {
 
         // Replies in context
         self.write_replies(&mut out, message)?;
-
-        // Rendered human-friendly block
-        let rendered = self.rendered_block(message, &attachments)?;
-        write_kv_literal_str(&mut out, 4, "rendered", &rendered)?;
-
-        // Extra debug hooks for lossless-ish recovery
-        out.push_str("    raw:\n");
-        out.push_str("      components_debug:\n");
-        for component in &message.components {
-            out.push_str("        - ");
-            out.push_str(&yaml_quote(&format!("{component:?}")));
-            out.push('\n');
-        }
 
         Ok(out)
     }
@@ -390,13 +376,24 @@ impl YAML<'_> {
         message: &Message,
         attachments: &mut Vec<Attachment>,
     ) -> Result<(), TableError> {
+        let text_component_count = message
+            .components
+            .iter()
+            .filter(|component| matches!(component, BubbleComponent::Text(_)))
+            .count();
+
         let mut attachment_index: usize = 0;
 
         for component in &message.components {
             match component {
                 BubbleComponent::Text(attrs) => {
                     out.push_str("      - kind: \"text\"\n");
-                    self.write_text_attributes(out, message.text.as_deref(), attrs)?;
+                    self.write_text_attributes(
+                        out,
+                        message.text.as_deref(),
+                        attrs,
+                        text_component_count,
+                    )?;
                 }
                 BubbleComponent::Attachment(meta) => {
                     out.push_str("      - kind: \"attachment\"\n");
@@ -430,19 +427,30 @@ impl YAML<'_> {
         out: &mut String,
         text: Option<&str>,
         attrs: &[TextAttributes],
+        _text_component_count: usize,
     ) -> Result<(), TableError> {
+        // YAML export represents message text in `components`; do not duplicate it at top-level.
         match text {
-            Some(text) => write_kv_literal_str(out, 8, "text", text)?,
+            Some(full_text) => {
+                let segment = extract_text_segment(full_text, attrs);
+                let component_text = if segment.is_empty() { full_text } else { &segment };
+                write_kv_literal_str(out, 8, "text", component_text)?;
+            }
             None => out.push_str("        text: null\n"),
         }
 
-        if attrs.is_empty() {
-            out.push_str("        attributes: []\n");
+        // If there are no non-default effects, omit attributes entirely to reduce noise.
+        let interesting_attrs: Vec<&TextAttributes> = attrs
+            .iter()
+            .filter(|attr| attr.effects.iter().any(|e| !matches!(e, TextEffect::Default)))
+            .collect();
+
+        if interesting_attrs.is_empty() {
             return Ok(());
         }
 
         out.push_str("        attributes:\n");
-        for attr in attrs {
+        for attr in interesting_attrs {
             out.push_str("          - start: ");
             let _ = write!(out, "{}", attr.start);
             out.push('\n');
@@ -456,15 +464,12 @@ impl YAML<'_> {
             } else {
                 out.push_str("            slice: null\n");
             }
-            if attr.effects.is_empty() {
-                out.push_str("            effects_debug: []\n");
-            } else {
-                out.push_str("            effects_debug:\n");
-                for effect in &attr.effects {
-                    out.push_str("              - ");
-                    out.push_str(&yaml_quote(&format!("{effect:?}")));
-                    out.push('\n');
-                }
+
+            out.push_str("            effects_debug:\n");
+            for effect in &attr.effects {
+                out.push_str("              - ");
+                out.push_str(&yaml_quote(&format!("{effect:?}")));
+                out.push('\n');
             }
         }
 
@@ -698,95 +703,10 @@ impl YAML<'_> {
                         )?;
                     }
                 }
-
-                let rendered = self.rendered_reply_block(reply);
-                write_kv_literal_str(out, 8, "rendered", &rendered)?;
             }
         }
 
         Ok(())
-    }
-
-    fn rendered_block(&self, message: &Message, attachments: &[Attachment]) -> Result<String, TableError> {
-        let mut out = String::with_capacity(1024);
-
-        let when = format(&message.date(&self.config.offset));
-        let who = self
-            .config
-            .who(message.handle_id, message.is_from_me(), &message.destination_caller_id);
-
-        let _ = writeln!(&mut out, "{when} {who}");
-
-        if message.is_deleted() {
-            let _ = writeln!(&mut out, "This message was deleted from the conversation!");
-        }
-        if let Some(subject) = &message.subject {
-            let _ = writeln!(&mut out, "Subject: {subject}");
-        }
-
-        if let Some(text) = &message.text
-            && !text.is_empty()
-        {
-            out.push_str(text);
-            if !text.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-
-        if !attachments.is_empty() {
-            let _ = writeln!(&mut out, "Attachments:");
-            for attachment in attachments {
-                let _ = writeln!(
-                    &mut out,
-                    "  - {}",
-                    self.config.message_attachment_path(attachment)
-                );
-            }
-        }
-
-        if let Some(tapbacks_by_part) = self.config.tapbacks.get(&message.guid) {
-            let mut any = false;
-            for tapbacks in tapbacks_by_part.values() {
-                if !tapbacks.is_empty() {
-                    any = true;
-                    break;
-                }
-            }
-            if any {
-                let _ = writeln!(&mut out, "Tapbacks:");
-                for tapbacks in tapbacks_by_part.values() {
-                    for tapback in tapbacks {
-                        let actor = if tapback.is_from_me() {
-                            self.config.options.custom_name.as_deref().unwrap_or(ME)
-                        } else {
-                            self.config
-                                .who(tapback.handle_id, false, &tapback.destination_caller_id)
-                        };
-                        let _ = writeln!(&mut out, "  - {actor}: {:?}", tapback.variant());
-                    }
-                }
-            }
-        }
-
-        Ok(out)
-    }
-
-    fn rendered_reply_block(&self, message: &Message) -> String {
-        let mut out = String::with_capacity(256);
-        let when = format(&message.date(&self.config.offset));
-        let who = self
-            .config
-            .who(message.handle_id, message.is_from_me(), &message.destination_caller_id);
-        let _ = writeln!(&mut out, "{when} {who}");
-        if let Some(text) = &message.text
-            && !text.is_empty()
-        {
-            out.push_str(text);
-            if !text.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        out
     }
 }
 
@@ -1029,4 +949,28 @@ fn write_timestamp_parts(
         None => write_kv_opt_str(out, spaces + 2, "display", None)?,
     };
     Ok(())
+}
+
+fn extract_text_segment(text: &str, attributes: &[TextAttributes]) -> String {
+    if text.is_empty() || attributes.is_empty() {
+        return String::new();
+    }
+
+    let mut rendered = String::with_capacity(text.len());
+    let mut prev_start = 0;
+    let mut prev_end = 0;
+
+    for attr in attributes {
+        if prev_start == attr.start && prev_end == attr.end {
+            continue;
+        }
+        prev_start = attr.start;
+        prev_end = attr.end;
+
+        if let Some(slice) = text.get(attr.start..attr.end) {
+            rendered.push_str(slice);
+        }
+    }
+
+    rendered
 }
