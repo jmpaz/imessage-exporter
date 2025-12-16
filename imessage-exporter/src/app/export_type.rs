@@ -11,6 +11,8 @@ pub enum ExportType {
     Html,
     /// Text file export
     Txt,
+    /// YAML file export
+    Yaml,
 }
 
 impl ExportType {
@@ -19,6 +21,7 @@ impl ExportType {
         match platform.to_lowercase().as_str() {
             "txt" => Some(Self::Txt),
             "html" => Some(Self::Html),
+            "yaml" | "yml" => Some(Self::Yaml),
             _ => None,
         }
     }
@@ -28,6 +31,7 @@ impl ExportType {
         match self {
             ExportType::Html => ".html",
             ExportType::Txt => ".txt",
+            ExportType::Yaml => ".yaml",
         }
     }
 }
@@ -37,6 +41,7 @@ impl Display for ExportType {
         match self {
             ExportType::Txt => write!(fmt, "txt"),
             ExportType::Html => write!(fmt, "html"),
+            ExportType::Yaml => write!(fmt, "yaml"),
         }
     }
 }
@@ -66,6 +71,23 @@ mod tests {
         assert!(matches!(ExportType::from_cli("txt"), Some(ExportType::Txt)));
         assert!(matches!(ExportType::from_cli("TXT"), Some(ExportType::Txt)));
         assert!(matches!(ExportType::from_cli("tXt"), Some(ExportType::Txt)));
+    }
+
+    #[test]
+    fn can_parse_yaml_any_case() {
+        assert!(matches!(
+            ExportType::from_cli("yaml"),
+            Some(ExportType::Yaml)
+        ));
+        assert!(matches!(
+            ExportType::from_cli("YAML"),
+            Some(ExportType::Yaml)
+        ));
+        assert!(matches!(
+            ExportType::from_cli("yMl"),
+            Some(ExportType::Yaml)
+        ));
+        assert!(matches!(ExportType::from_cli("yml"), Some(ExportType::Yaml)));
     }
 
     #[test]
